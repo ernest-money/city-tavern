@@ -1,0 +1,10 @@
+[package]
+name = "ernest-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bitcoin = { version = "0.32.3", features = ["rand", "rand-std"] }
+lightning = "0.0.124"
+lightning-net-tokio = "0.0.124"
+tokio = { version = "1.40.0", features = ["full"] }
