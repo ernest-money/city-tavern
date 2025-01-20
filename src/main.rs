@@ -2,23 +2,19 @@
 mod routed_message;
 
 use bitcoin::{key::rand::Fill, secp256k1::PublicKey};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio::sync::Mutex;
-// use dlc_messages::message_handler::MessageHandler as DlcMessageHandler;
 use lightning::{
     ln::peer_handler::{
-        CustomMessageHandler, ErroringMessageHandler, IgnoringMessageHandler, MessageHandler,
-        PeerManager,
+        ErroringMessageHandler, IgnoringMessageHandler, MessageHandler, PeerManager,
     },
     sign::{KeysManager, NodeSigner},
     util::logger::Logger,
 };
 use lightning_net_tokio::{connect_outbound, setup_inbound, SocketDescriptor};
-use routed_message::{ProxyMessageHandler, RoutedMessage};
+use routed_message::ProxyMessageHandler;
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::net::TcpListener;
 
 #[derive(Clone, Debug, Copy)]
@@ -26,7 +22,7 @@ struct Log;
 
 impl Logger for Log {
     fn log(&self, record: lightning::util::logger::Record) {
-        println!("{}", record.args);
+        // println!("{}", record.args);
     }
 }
 
@@ -43,7 +39,6 @@ type ErnestProxy = PeerManager<
 struct CityTavern {
     peer_manager: Arc<ErnestProxy>,
     pub message_handler: Arc<ProxyMessageHandler>,
-    connected_peers: Arc<Mutex<HashMap<PublicKey, bool>>>,
     key_manager: Arc<KeysManager>,
     stop_signal: tokio::sync::watch::Receiver<bool>,
     listening_port: u16,
@@ -88,15 +83,12 @@ impl CityTavern {
             node_signer.clone(),
         ));
 
-        let connected_peers = Arc::new(Mutex::new(HashMap::new()));
-
         Self {
             peer_manager,
             message_handler: dlc_message_handler,
             key_manager: node_signer,
             stop_signal,
             listening_port,
-            connected_peers,
             node_id,
         }
     }
@@ -147,7 +139,6 @@ impl CityTavern {
         let mut event_ticker = tokio::time::interval(Duration::from_secs(1));
         let peer_manager = self.peer_manager.clone();
         let message_handler = self.message_handler.clone();
-        let connected_peers = self.connected_peers.clone();
         let mut stop_signal = self.stop_signal.clone();
         let midnight_rider = self.node_id.clone();
         loop {
@@ -160,8 +151,6 @@ impl CityTavern {
                 }
                 _ = event_ticker.tick() => {
                     peer_manager.process_events();
-                    event_handler(midnight_rider, message_handler.clone(), connected_peers.clone()).await;
-
                 }
             }
         }
@@ -171,36 +160,6 @@ impl CityTavern {
         let peer_manager = self.peer_manager.clone();
         connect_outbound(peer_manager, peer_id, addr.parse().unwrap()).await;
         Ok(())
-    }
-
-    fn send_message(&self, msg: RoutedMessage) -> anyhow::Result<()> {
-        self.message_handler
-            .send_message(msg)
-            .expect("failed to send message");
-        Ok(())
-    }
-}
-
-async fn event_handler(
-    midnight_rider: PublicKey,
-    message_handler: Arc<ProxyMessageHandler>,
-    connected_peers: Arc<Mutex<HashMap<PublicKey, bool>>>,
-) {
-    let events = message_handler.get_and_clear_pending_msg();
-
-    for event in events {
-        if event.1.from != event.0 {
-            println!("Message is not from who it should be: {:?}", event);
-        }
-
-        if event.1.to == midnight_rider {
-            println!("Received an offer from: {:?}", event.1.from);
-        }
-
-        if connected_peers.lock().await.contains_key(&event.0) {
-            println!("Sending message to: {:?}", event.1.to);
-            message_handler.send_message(event.1).unwrap()
-        }
     }
 }
 
@@ -236,13 +195,13 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use dlc_messages::AcceptDlc;
-    use routed_message::RoutedMessage;
+    use dlc_messages::{AcceptDlc, OfferDlc};
+    use routed_message::{RoutedMessage, ACCEPT_TYPE, OFFER_TYPE};
 
     use super::*;
 
     #[tokio::test]
-    async fn test_listen() {
+    async fn accept() {
         let (stop_signal, stop_receiver) = tokio::sync::watch::channel(false);
         let tavern = Arc::new(CityTavern::new(stop_receiver.clone(), 1776));
         let tavern_two = Arc::new(CityTavern::new(stop_receiver, 1778));
@@ -267,20 +226,87 @@ mod tests {
         let accept_msg = include_str!("./test_inputs/accept_msg.json");
         let accept_msg: AcceptDlc = serde_json::from_str(&accept_msg).unwrap();
         let routed_msg = RoutedMessage {
+            msg_type: ACCEPT_TYPE,
             to: tavern_two.public_key(),
             from: tavern.public_key(),
             message: dlc_messages::Message::Accept(accept_msg),
         };
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        tavern.message_handler.send_message(routed_msg).unwrap();
+        tavern
+            .message_handler
+            .send_message(routed_msg, tavern_two.public_key())
+            .unwrap();
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        println!("processing events");
+
         tavern.peer_manager.process_events();
         tavern_two.peer_manager.process_events();
         let msgs = tavern_two.message_handler.get_and_clear_received_messages();
-        println!("msgs: {:?}", msgs);
+
+        stop_signal.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn offer() {
+        let (stop_signal, stop_receiver) = tokio::sync::watch::channel(false);
+        let alice = Arc::new(CityTavern::new(stop_receiver.clone(), 1776));
+        let bob = Arc::new(CityTavern::new(stop_receiver.clone(), 1778));
+        let proxy = Arc::new(CityTavern::new(stop_receiver, 1781));
+
+        let alice_clone = alice.clone();
+        tokio::spawn(async move {
+            alice_clone.listen().await.unwrap();
+        });
+
+        let bob_clone = bob.clone();
+        tokio::spawn(async move {
+            bob_clone.listen().await.unwrap();
+        });
+
+        let proxy_clone = proxy.clone();
+        tokio::spawn(async move {
+            proxy_clone.listen().await.unwrap();
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        alice
+            .connect_to_peer(proxy.public_key(), "127.0.0.1:1781")
+            .await
+            .unwrap();
+
+        bob.connect_to_peer(proxy.public_key(), "127.0.0.1:1781")
+            .await
+            .unwrap();
+
+        let offer_msg = include_str!("./test_inputs/offer_msg.json");
+        let offer_msg: OfferDlc = serde_json::from_str(&offer_msg).unwrap();
+        let routed_msg = RoutedMessage {
+            msg_type: OFFER_TYPE,
+            to: bob.public_key(),
+            from: alice.public_key(),
+            message: dlc_messages::Message::Offer(offer_msg),
+        };
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+        alice
+            .message_handler
+            .send_message(routed_msg, proxy.public_key())
+            .unwrap();
+
+        alice.peer_manager.process_events();
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let msgs = proxy.message_handler.get_and_clear_received_messages();
+
+        assert!(msgs.len() > 0);
+        proxy.peer_manager.process_events();
+
+        let bob_msgs = bob.message_handler.get_and_clear_received_messages();
+
+        assert!(bob_msgs.len() > 0);
+
         stop_signal.send(true).unwrap();
     }
 }
