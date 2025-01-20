@@ -203,23 +203,33 @@ mod tests {
     #[tokio::test]
     async fn accept() {
         let (stop_signal, stop_receiver) = tokio::sync::watch::channel(false);
-        let tavern = Arc::new(CityTavern::new(stop_receiver.clone(), 1776));
-        let tavern_two = Arc::new(CityTavern::new(stop_receiver, 1778));
+        let alice = Arc::new(CityTavern::new(stop_receiver.clone(), 1776));
+        let bob = Arc::new(CityTavern::new(stop_receiver.clone(), 1778));
+        let proxy = Arc::new(CityTavern::new(stop_receiver, 1781));
 
-        let tavern_one_clone = tavern.clone();
+        let alice_clone = alice.clone();
         tokio::spawn(async move {
-            tavern_one_clone.listen().await.unwrap();
+            alice_clone.listen().await.unwrap();
         });
 
-        let tavern_two_clone = tavern_two.clone();
+        let bob_clone = bob.clone();
         tokio::spawn(async move {
-            tavern_two_clone.listen().await.unwrap();
+            bob_clone.listen().await.unwrap();
+        });
+
+        let proxy_clone = proxy.clone();
+        tokio::spawn(async move {
+            proxy_clone.listen().await.unwrap();
         });
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
-        tavern
-            .connect_to_peer(tavern_two.public_key(), "127.0.0.1:1778")
+        alice
+            .connect_to_peer(proxy.public_key(), "127.0.0.1:1781")
+            .await
+            .unwrap();
+
+        bob.connect_to_peer(proxy.public_key(), "127.0.0.1:1781")
             .await
             .unwrap();
 
@@ -227,22 +237,26 @@ mod tests {
         let accept_msg: AcceptDlc = serde_json::from_str(&accept_msg).unwrap();
         let routed_msg = RoutedMessage {
             msg_type: ACCEPT_TYPE,
-            to: tavern_two.public_key(),
-            from: tavern.public_key(),
+            to: bob.public_key(),
+            from: alice.public_key(),
             message: dlc_messages::Message::Accept(accept_msg),
         };
 
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        tavern
+        alice
             .message_handler
-            .send_message(routed_msg, tavern_two.public_key())
+            .send_message(routed_msg, proxy.public_key())
             .unwrap();
-
+        alice.peer_manager.process_events();
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let msgs = proxy.message_handler.get_and_clear_received_messages();
 
-        tavern.peer_manager.process_events();
-        tavern_two.peer_manager.process_events();
-        let msgs = tavern_two.message_handler.get_and_clear_received_messages();
+        assert!(msgs.len() > 0);
+        proxy.peer_manager.process_events();
+
+        let bob_msgs = bob.message_handler.get_and_clear_received_messages();
+
+        assert!(bob_msgs.len() > 0);
 
         stop_signal.send(true).unwrap();
     }

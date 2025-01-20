@@ -1,9 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
+    fmt::{Debug, Display},
     sync::{Arc, Mutex},
 };
 
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::{io::Cursor, secp256k1::PublicKey};
+use dlc_messages::segmentation;
 use dlc_messages::{message_handler::read_dlc_message, Message, WireMessage};
 use lightning::{
     io::Read,
@@ -13,7 +15,7 @@ use lightning::{
         peer_handler::CustomMessageHandler,
         wire::{CustomMessageReader, Type},
     },
-    util::ser::{Readable, Writeable, Writer},
+    util::ser::{Readable, Writeable, Writer, MAX_BUF_SIZE},
 };
 
 /// The type prefix for an [`OfferDlc`] message.
@@ -89,17 +91,112 @@ impl Readable for RoutedMessage {
     }
 }
 
+pub enum ProxyMessage {
+    RoutedMessage(RoutedMessage),
+    SegmentStart(segmentation::SegmentStart),
+    SegmentChunk(segmentation::SegmentChunk),
+}
+
+macro_rules! impl_type_writeable_for_enum {
+    ($type_name: ident, {$($variant_name: ident),*}) => {
+       impl Type for $type_name {
+           fn type_id(&self) -> u16 {
+               match self {
+                   $($type_name::$variant_name(v) => v.type_id(),)*
+               }
+           }
+       }
+
+       impl Writeable for $type_name {
+            fn write<W: Writer>(&self, writer: &mut W) -> Result<(), ::lightning::io::Error> {
+                match self {
+                   $($type_name::$variant_name(v) => v.write(writer),)*
+                }
+            }
+       }
+    };
+}
+
+impl Debug for ProxyMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::RoutedMessage(_) => "RoutedMessage",
+            Self::SegmentStart(_) => "SegmentStart",
+            Self::SegmentChunk(_) => "SegmentChunk",
+        };
+        f.write_str(name)
+    }
+}
+
+impl_type_writeable_for_enum!(ProxyMessage, { RoutedMessage, SegmentStart, SegmentChunk });
+
 #[derive(Default)]
 pub struct ProxyMessageHandler {
-    events: Mutex<Vec<(PublicKey, RoutedMessage)>>,
+    events: Mutex<VecDeque<(PublicKey, ProxyMessage)>>,
     received_messages: Mutex<Vec<(PublicKey, RoutedMessage)>>,
     connected_peers: Arc<Mutex<HashMap<PublicKey, bool>>>,
+    segment_readers: Arc<Mutex<HashMap<PublicKey, segmentation::segment_reader::SegmentReader>>>,
 }
 
 impl ProxyMessageHandler {
-    pub fn send_message(&self, msg: RoutedMessage, to: PublicKey) -> anyhow::Result<()> {
-        println!("sending message to {:?}", msg.to);
-        self.events.lock().unwrap().push((to, msg));
+    pub fn send_message(&self, msg: RoutedMessage, node_id: PublicKey) -> anyhow::Result<()> {
+        println!("sending message to {:?}", node_id);
+        if msg.serialized_length() > MAX_BUF_SIZE {
+            let (seg_start, seg_chunks) = segmentation::get_segments(msg.encode(), msg.type_id());
+            let mut msg_events = self.events.lock().unwrap();
+            msg_events.push_back((node_id, ProxyMessage::SegmentStart(seg_start)));
+            for chunk in seg_chunks {
+                msg_events.push_back((node_id, ProxyMessage::SegmentChunk(chunk)));
+            }
+        } else {
+            self.events
+                .lock()
+                .unwrap()
+                .push_back((node_id, ProxyMessage::RoutedMessage(msg)));
+        }
+        Ok(())
+    }
+
+    pub fn handle_routed_message(
+        &self,
+        message: RoutedMessage,
+        sender_node_id: &PublicKey,
+    ) -> Result<(), LightningError> {
+        // handle the proxy stuff
+        let msg_clone = message.clone();
+
+        if &message.from != sender_node_id {
+            println!(
+                "Message is not from who it should be: {:?}",
+                message.message
+            );
+        }
+
+        if message.to == message.from {
+            println!("Received an offer from: {:?}", message.from);
+        }
+
+        if self
+            .connected_peers
+            .lock()
+            .unwrap()
+            .contains_key(&message.to)
+        {
+            println!("Received a proxy connection: {:?}", message.to);
+            let route_msg = RoutedMessage {
+                msg_type: message.msg_type,
+                to: message.to,
+                from: message.from,
+                message: message.message,
+            };
+            self.send_message(route_msg.clone(), route_msg.to).unwrap()
+        } else {
+            println!("Not connected to the peer: {}", message.to.to_string())
+        }
+        self.received_messages
+            .lock()
+            .unwrap()
+            .push((*sender_node_id, msg_clone));
         Ok(())
     }
 
@@ -113,19 +210,22 @@ impl ProxyMessageHandler {
 }
 
 impl CustomMessageReader for ProxyMessageHandler {
-    type CustomMessage = RoutedMessage;
+    type CustomMessage = ProxyMessage;
     fn read<R: Read>(
         &self,
         msg_type: u16,
         buffer: &mut R,
     ) -> Result<Option<Self::CustomMessage>, DecodeError> {
-        match msg_type {
-            ROUTED_MESSAGE_TYPE_ID => {
+        let decoded = match msg_type {
+            segmentation::SEGMENT_START_TYPE => ProxyMessage::SegmentStart(Readable::read(buffer)?),
+            segmentation::SEGMENT_CHUNK_TYPE => ProxyMessage::SegmentChunk(Readable::read(buffer)?),
+            _ => {
                 let message: RoutedMessage = Readable::read(buffer)?;
-                Ok(Some(message))
+                ProxyMessage::RoutedMessage(message)
             }
-            _ => Ok(None),
-        }
+        };
+
+        Ok(Some(decoded))
     }
 }
 
@@ -135,38 +235,59 @@ impl CustomMessageHandler for ProxyMessageHandler {
         msg: Self::CustomMessage,
         sender_node_id: &PublicKey,
     ) -> Result<(), LightningError> {
-        println!(
-            "Received routed message from {:?}: {:?}",
-            sender_node_id, msg
-        );
+        let mut segment_readers = self.segment_readers.lock().unwrap();
+        let segment_reader = segment_readers.entry(*sender_node_id).or_default();
 
-        let msg_clone = msg.clone();
-
-        if &msg.from != sender_node_id {
-            println!("Message is not from who it should be: {:?}", msg.message);
+        if segment_reader.expecting_chunk() {
+            match msg {
+                ProxyMessage::SegmentChunk(s) => {
+                    if let Some(msg) = segment_reader
+                        .process_segment_chunk(s)
+                        .map_err(|e| to_ln_error(e, "Error processing segment chunk"))?
+                    {
+                        let mut buf = Cursor::new(msg);
+                        let message_type = <u16 as Readable>::read(&mut buf).map_err(|e| {
+                            to_ln_error(e, "Could not reconstruct message from segments")
+                        })?;
+                        if let ProxyMessage::RoutedMessage(message) = self
+                            .read(message_type, &mut buf)
+                            .map_err(|e| {
+                                to_ln_error(e, "Could not reconstruct message from segments")
+                            })?
+                            .expect("to have a message")
+                        {
+                            self.handle_routed_message(message, sender_node_id)?;
+                        } else {
+                            return Err(to_ln_error(
+                                "Unexpected message type",
+                                &message_type.to_string(),
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // We were expecting a segment chunk but received something
+                    // else, we reset the state.
+                    segment_reader.reset();
+                }
+            }
         }
 
-        if msg.to == msg.from {
-            println!("Received an offer from: {:?}", msg.from);
-        }
-
-        if self.connected_peers.lock().unwrap().contains_key(&msg.to) {
-            println!("Received a proxy connection: {:?}", msg.to);
-            let route_msg = RoutedMessage {
-                msg_type: msg.msg_type,
-                to: msg.to,
-                from: msg.from,
-                message: msg.message,
-            };
-            self.send_message(route_msg.clone(), route_msg.to).unwrap()
-        } else {
-            println!("Not connected to the peer: {}", msg.to.to_string())
-        }
-
-        self.received_messages
-            .lock()
-            .unwrap()
-            .push((msg.from, msg_clone));
+        match msg {
+            ProxyMessage::RoutedMessage(message) => {
+                self.handle_routed_message(message, sender_node_id)?
+            }
+            ProxyMessage::SegmentStart(s) => segment_reader
+                .process_segment_start(s)
+                .map_err(|e| to_ln_error(e, "Error processing segment start"))?,
+            ProxyMessage::SegmentChunk(_) => {
+                return Err(LightningError {
+                    err: "Received a SegmentChunk while not expecting one.".to_string(),
+                    action: lightning::ln::msgs::ErrorAction::DisconnectPeer { msg: None },
+                });
+            }
+        };
         Ok(())
     }
 
@@ -199,5 +320,13 @@ impl CustomMessageHandler for ProxyMessageHandler {
 
     fn provided_init_features(&self, their_node_id: &PublicKey) -> InitFeatures {
         InitFeatures::empty()
+    }
+}
+
+#[inline]
+fn to_ln_error<T: Display>(e: T, msg: &str) -> LightningError {
+    LightningError {
+        err: format!("{} :{}", msg, e),
+        action: lightning::ln::msgs::ErrorAction::DisconnectPeer { msg: None },
     }
 }
