@@ -1,16 +1,18 @@
 #![allow(dead_code, unused_variables)]
+mod midnight_rider;
 mod routed_message;
 
+use anyhow::anyhow;
 use bitcoin::{key::rand::Fill, secp256k1::PublicKey};
 use lightning::{
     ln::peer_handler::{
         ErroringMessageHandler, IgnoringMessageHandler, MessageHandler, PeerManager,
     },
-    sign::{KeysManager, NodeSigner, Recipient},
+    sign::{KeysManager, NodeSigner},
     util::logger::Logger,
 };
 use lightning_net_tokio::{connect_outbound, setup_inbound, SocketDescriptor};
-use routed_message::ProxyMessageHandler;
+use midnight_rider::MidnightRider;
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,19 +28,19 @@ impl Logger for Log {
     }
 }
 
-type ErnestProxy = PeerManager<
+type CityTavenPeerManager = PeerManager<
     SocketDescriptor,
     Arc<ErroringMessageHandler>,
     Arc<IgnoringMessageHandler>,
     Arc<IgnoringMessageHandler>,
     Arc<Log>,
-    Arc<ProxyMessageHandler>,
+    Arc<MidnightRider>,
     Arc<KeysManager>,
 >;
 
-struct CityTavern {
-    peer_manager: Arc<ErnestProxy>,
-    pub message_handler: Arc<ProxyMessageHandler>,
+pub struct CityTavern {
+    peer_manager: Arc<CityTavenPeerManager>,
+    pub message_handler: Arc<MidnightRider>,
     key_manager: Arc<KeysManager>,
     stop_signal: tokio::sync::watch::Receiver<bool>,
     listening_port: u16,
@@ -46,18 +48,16 @@ struct CityTavern {
 }
 
 impl CityTavern {
-    fn new(
+    pub fn new(
         stop_signal: tokio::sync::watch::Receiver<bool>,
         listening_port: u16,
         // If None, the node will be a proxy node.
         proxy_node_id: Option<PublicKey>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let logger = Log {};
 
         let mut rand_bytes = [0u8; 32];
-        rand_bytes
-            .try_fill(&mut bitcoin::key::rand::thread_rng())
-            .unwrap();
+        rand_bytes.try_fill(&mut bitcoin::key::rand::thread_rng())?;
 
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -70,9 +70,13 @@ impl CityTavern {
             current_time,
         ));
 
-        let dlc_message_handler = Arc::new(ProxyMessageHandler::new(
-            proxy_node_id.unwrap_or(node_signer.get_node_id(Recipient::Node).unwrap()),
-            node_signer.get_node_id(Recipient::Node).unwrap(),
+        let my_node_id = node_signer
+            .get_node_id(lightning::sign::Recipient::Node)
+            .map_err(|_| anyhow!("Couldn't get node id"))?;
+
+        let dlc_message_handler = Arc::new(MidnightRider::new(
+            proxy_node_id.unwrap_or(my_node_id),
+            my_node_id,
         ));
 
         let message_handler = MessageHandler {
@@ -82,10 +86,7 @@ impl CityTavern {
             custom_message_handler: dlc_message_handler.clone(),
         };
 
-        let node_id = node_signer
-            .get_node_id(lightning::sign::Recipient::Node)
-            .unwrap();
-        let peer_manager: Arc<ErnestProxy> = Arc::new(PeerManager::new(
+        let peer_manager: Arc<CityTavenPeerManager> = Arc::new(PeerManager::new(
             message_handler,
             current_time,
             &rand_bytes,
@@ -93,23 +94,21 @@ impl CityTavern {
             node_signer.clone(),
         ));
 
-        Self {
+        Ok(Self {
             peer_manager,
             message_handler: dlc_message_handler,
             key_manager: node_signer,
             stop_signal,
             listening_port,
-            node_id,
-        }
+            node_id: my_node_id,
+        })
     }
 
     pub fn public_key(&self) -> PublicKey {
-        self.key_manager
-            .get_node_id(lightning::sign::Recipient::Node)
-            .unwrap()
+        self.node_id
     }
 
-    async fn listen(&self) -> anyhow::Result<()> {
+    pub async fn listen(&self) -> anyhow::Result<()> {
         println!("Listening on port {}", self.listening_port);
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.listening_port))
             .await
@@ -145,7 +144,7 @@ impl CityTavern {
         Ok(())
     }
 
-    async fn process_messages(&self) {
+    pub async fn process_messages(&self) {
         let mut event_ticker = tokio::time::interval(Duration::from_secs(1));
         let peer_manager = self.peer_manager.clone();
         let message_handler = self.message_handler.clone();
@@ -167,40 +166,9 @@ impl CityTavern {
     }
 
     async fn connect_to_peer(&self, peer_id: PublicKey, addr: &str) -> anyhow::Result<()> {
-        let peer_manager = self.peer_manager.clone();
-        connect_outbound(peer_manager, peer_id, addr.parse().unwrap()).await;
+        connect_outbound(self.peer_manager.clone(), peer_id, addr.parse().unwrap()).await;
         Ok(())
     }
-}
-
-#[tokio::main]
-async fn main() {
-    let (stop_signal, stop_receiver) = tokio::sync::watch::channel(false);
-    let tavern = Arc::new(CityTavern::new(stop_receiver, 1778, None));
-
-    let _ = TcpListener::bind(format!("0.0.0.0:{}", 1778))
-        .await
-        .expect("Coldn't get port.");
-
-    println!(
-        "node id: {}",
-        tavern
-            .key_manager
-            .get_node_id(lightning::sign::Recipient::Node)
-            .unwrap()
-            .to_string()
-    );
-
-    let tavern_clone = tavern.clone();
-    tokio::spawn(async move {
-        tavern_clone.process_messages().await;
-    });
-    // tokio::spawn(async move {
-    tavern.listen().await.unwrap();
-    // });
-
-    // tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    // stop_signal.send(true).unwrap();
 }
 
 #[cfg(test)]
@@ -213,17 +181,11 @@ mod tests {
     #[tokio::test]
     async fn accept() {
         let (stop_signal, stop_receiver) = tokio::sync::watch::channel(false);
-        let proxy = Arc::new(CityTavern::new(stop_receiver.clone(), 1781, None));
-        let alice = Arc::new(CityTavern::new(
-            stop_receiver.clone(),
-            1776,
-            Some(proxy.public_key()),
-        ));
-        let bob = Arc::new(CityTavern::new(
-            stop_receiver,
-            1778,
-            Some(proxy.public_key()),
-        ));
+        let proxy = Arc::new(CityTavern::new(stop_receiver.clone(), 1781, None).unwrap());
+        let alice = Arc::new(
+            CityTavern::new(stop_receiver.clone(), 1776, Some(proxy.public_key())).unwrap(),
+        );
+        let bob = Arc::new(CityTavern::new(stop_receiver, 1778, Some(proxy.public_key())).unwrap());
 
         let alice_clone = alice.clone();
         tokio::spawn(async move {
@@ -283,17 +245,11 @@ mod tests {
     #[tokio::test]
     async fn offer() {
         let (stop_signal, stop_receiver) = tokio::sync::watch::channel(false);
-        let proxy = Arc::new(CityTavern::new(stop_receiver.clone(), 1781, None));
-        let alice = Arc::new(CityTavern::new(
-            stop_receiver.clone(),
-            1776,
-            Some(proxy.public_key()),
-        ));
-        let bob = Arc::new(CityTavern::new(
-            stop_receiver,
-            1778,
-            Some(proxy.public_key()),
-        ));
+        let proxy = Arc::new(CityTavern::new(stop_receiver.clone(), 1781, None).unwrap());
+        let alice = Arc::new(
+            CityTavern::new(stop_receiver.clone(), 1776, Some(proxy.public_key())).unwrap(),
+        );
+        let bob = Arc::new(CityTavern::new(stop_receiver, 1778, Some(proxy.public_key())).unwrap());
 
         let alice_clone = alice.clone();
         tokio::spawn(async move {
