@@ -18,6 +18,9 @@ use lightning::{
     util::ser::{Readable, Writeable, Writer, MAX_BUF_SIZE},
 };
 
+/// The type prefix for a routed message.
+const ROUTED_MESSAGE_TYPE_ID: u16 = 1776;
+
 /// The type prefix for an [`OfferDlc`] message.
 pub const OFFER_TYPE: u16 = 42778;
 
@@ -29,8 +32,6 @@ pub const SIGN_TYPE: u16 = 42782;
 
 /// The type prefix for a [`Reject`] message.
 pub const REJECT: u16 = 43024;
-
-const ROUTED_MESSAGE_TYPE_ID: u16 = 1776;
 
 #[derive(Debug, Clone)]
 pub struct RoutedMessage {
@@ -130,15 +131,31 @@ impl Debug for ProxyMessage {
 
 impl_type_writeable_for_enum!(ProxyMessage, { RoutedMessage, SegmentStart, SegmentChunk });
 
-#[derive(Default)]
 pub struct ProxyMessageHandler {
     events: Mutex<VecDeque<(PublicKey, ProxyMessage)>>,
     received_messages: Mutex<Vec<(PublicKey, RoutedMessage)>>,
     connected_peers: Arc<Mutex<HashMap<PublicKey, bool>>>,
     segment_readers: Arc<Mutex<HashMap<PublicKey, segmentation::segment_reader::SegmentReader>>>,
+    proxy_node_id: PublicKey,
+    my_node_id: PublicKey,
 }
 
 impl ProxyMessageHandler {
+    pub fn new(proxy_node_id: PublicKey, my_node_id: PublicKey) -> Self {
+        Self {
+            events: Mutex::new(VecDeque::new()),
+            received_messages: Mutex::new(Vec::new()),
+            connected_peers: Arc::new(Mutex::new(HashMap::new())),
+            segment_readers: Arc::new(Mutex::new(HashMap::new())),
+            proxy_node_id,
+            my_node_id,
+        }
+    }
+
+    fn is_proxy_node(&self) -> bool {
+        self.my_node_id == self.proxy_node_id
+    }
+
     pub fn send_message(&self, msg: RoutedMessage, node_id: PublicKey) -> anyhow::Result<()> {
         println!("sending message to {:?}", node_id);
         if msg.serialized_length() > MAX_BUF_SIZE {
@@ -165,15 +182,29 @@ impl ProxyMessageHandler {
         // handle the proxy stuff
         let msg_clone = message.clone();
 
-        if &message.from != sender_node_id {
-            println!(
-                "Message is not from who it should be: {:?}",
-                message.message
-            );
+        // handle receiving an offer to the proxy
+        if self.is_proxy_node() && message.to == self.proxy_node_id {
+            println!("Received an offer to the proxy.");
+            self.received_messages
+                .lock()
+                .unwrap()
+                .push((message.from, msg_clone));
+            // assert that it is an actual offer
+            return Ok(());
         }
 
-        if message.to == message.from {
-            println!("Received an offer from: {:?}", message.from);
+        // handle receiving a proxied message
+        if sender_node_id == &self.proxy_node_id && message.to == self.my_node_id {
+            println!("Received a proxied message: {:?}", sender_node_id);
+            self.received_messages
+                .lock()
+                .unwrap()
+                .push((message.from, msg_clone));
+            return Ok(());
+        }
+
+        if &message.from != sender_node_id {
+            println!("Message is not from who it should be. Invalid message:");
         }
 
         if self
@@ -193,10 +224,7 @@ impl ProxyMessageHandler {
         } else {
             println!("Not connected to the peer: {}", message.to.to_string())
         }
-        self.received_messages
-            .lock()
-            .unwrap()
-            .push((*sender_node_id, msg_clone));
+
         Ok(())
     }
 
