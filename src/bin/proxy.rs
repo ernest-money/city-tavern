@@ -1,4 +1,4 @@
-use midnight_rider::CityTavern;
+use city_tavern::CityTavern;
 use std::sync::Arc;
 use tracing::level_filters::LevelFilter;
 
