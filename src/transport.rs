@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::message_to_message_type;
 use crate::{routed_message::RoutedMessage, CityTavern};
 use bitcoin::secp256k1::PublicKey;
 use ddk::DlcDevKitDlcManager;
@@ -23,7 +24,7 @@ impl Transport for CityTavern {
     ) -> Result<(), anyhow::Error> {
         let listen_handle = self.listen(stop_signal.clone());
 
-        let process_handle = self.process_messages(stop_signal.clone());
+        let process_handle = self.process_messages(stop_signal.clone(), manager);
 
         // Wait for either task to complete or stop signal
         tokio::select! {
@@ -37,10 +38,10 @@ impl Transport for CityTavern {
         let routed_msg = RoutedMessage {
             to: peer_id,
             from: self.public_key(),
-            msg_type: crate::routed_message::OFFER_TYPE,
+            msg_type: message_to_message_type(&msg).unwrap(),
             message: msg,
         };
-        self.midnight_rider.send_message(routed_msg, peer_id);
+        self.midnight_rider.send_message(routed_msg);
     }
 
     async fn connect_outbound(&self, peer_id: PublicKey, addr: &str) {
