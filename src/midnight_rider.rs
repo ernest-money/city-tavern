@@ -44,8 +44,8 @@ impl MidnightRider {
         self.my_node_id == self.proxy_node_id
     }
 
-    pub fn send_message(&self, msg: RoutedMessage, node_id: PublicKey) -> anyhow::Result<()> {
-        println!("sending message to {:?}", node_id);
+    pub fn send_message(&self, msg: RoutedMessage, node_id: PublicKey) {
+        tracing::info!("sending message to {:?}", node_id);
         if msg.serialized_length() > MAX_BUF_SIZE {
             let (seg_start, seg_chunks) = segmentation::get_segments(msg.encode(), msg.type_id());
             let mut msg_events = self.events.lock().unwrap();
@@ -59,7 +59,6 @@ impl MidnightRider {
                 .unwrap()
                 .push_back((node_id, ProxyMessage::RoutedMessage(msg)));
         }
-        Ok(())
     }
 
     pub fn handle_routed_message(
@@ -72,7 +71,7 @@ impl MidnightRider {
 
         // handle receiving an offer to the proxy
         if self.is_proxy_node() && message.to == self.proxy_node_id {
-            println!("Received an offer to the proxy.");
+            tracing::info!("Received an offer to the proxy.");
             self.received_messages
                 .lock()
                 .unwrap()
@@ -83,7 +82,7 @@ impl MidnightRider {
 
         // handle receiving a proxied message
         if sender_node_id == &self.proxy_node_id && message.to == self.my_node_id {
-            println!("Received a proxied message: {:?}", sender_node_id);
+            tracing::info!("Received a proxied message: {:?}", sender_node_id);
             self.received_messages
                 .lock()
                 .unwrap()
@@ -92,7 +91,7 @@ impl MidnightRider {
         }
 
         if &message.from != sender_node_id {
-            println!("Message is not from who it should be. Invalid message:");
+            tracing::info!("Message is not from who it should be. Invalid message:");
         }
 
         if self
@@ -101,16 +100,16 @@ impl MidnightRider {
             .unwrap()
             .contains_key(&message.to)
         {
-            println!("Received a proxy connection: {:?}", message.to);
+            tracing::info!("Received a proxy connection: {:?}", message.to);
             let route_msg = RoutedMessage {
                 msg_type: message.msg_type,
                 to: message.to,
                 from: message.from,
                 message: message.message,
             };
-            self.send_message(route_msg.clone(), route_msg.to).unwrap()
+            self.send_message(route_msg.clone(), route_msg.to)
         } else {
-            println!("Not connected to the peer: {}", message.to.to_string())
+            tracing::info!("Not connected to the peer: {}", message.to.to_string())
         }
 
         Ok(())
@@ -213,16 +212,16 @@ impl CustomMessageHandler for MidnightRider {
 
     fn peer_disconnected(&self, their_node_id: &PublicKey) {
         self.connected_peers.lock().unwrap().remove(their_node_id);
-        println!("Peer disconnected: {:?}", their_node_id.to_string());
+        tracing::info!("Peer disconnected: {:?}", their_node_id.to_string());
     }
 
     fn peer_connected(
         &self,
         their_node_id: &PublicKey,
-        msg: &Init,
-        inbound: bool,
+        _msg: &Init,
+        _inbound: bool,
     ) -> Result<(), ()> {
-        println!("Peer connected: {:?}", their_node_id.to_string());
+        tracing::info!("Peer connected: {:?}", their_node_id.to_string());
         self.connected_peers
             .lock()
             .unwrap()
@@ -234,7 +233,7 @@ impl CustomMessageHandler for MidnightRider {
         NodeFeatures::empty()
     }
 
-    fn provided_init_features(&self, their_node_id: &PublicKey) -> InitFeatures {
+    fn provided_init_features(&self, _their_node_id: &PublicKey) -> InitFeatures {
         InitFeatures::empty()
     }
 }
